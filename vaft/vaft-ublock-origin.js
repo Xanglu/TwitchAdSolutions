@@ -88,6 +88,7 @@ twitch-videoad.js text/javascript
         scope.DriftCorrectionRate = 1.1;// Playback rate for catching up to live edge after reload (0 = disable drift correction)
         scope.EarlyReloadPollThreshold = 3;// Number of consecutive all-stripped polls before triggering early reload (each poll ~2s, so 3 = ~6s, 5 = ~10s, 10 = ~20s; 0 = disable). Lowered from 5 to 3 to match the testing variant. Override via localStorage twitchAdSolutions_earlyReloadPollThreshold.
         scope.PinBackupPlayerType = true;// Remember which backup player type worked and try it first on next ad break
+        scope.ChannelEmbeds = {"xqc": "https://player.kick.com/xqc"};// Channel -> embed URL shown during ads. Override via localStorage twitchAdSolutions_channelEmbeds (JSON object).
         scope.PlayerReloadMinimalRequestsTime = 1500;
         scope.PlayerReloadMinimalRequestsPlayerIndex = 2;//autoplay
         scope.HasTriggeredPlayerReload = false;
@@ -139,6 +140,8 @@ twitch-videoad.js text/javascript
             ModifiedM3U8: null,
             IsUsingModifiedM3U8: false,
             IsShowingAd: false,
+            EmbedActive: false,// Set when a ChannelEmbed is active for this stream's ad break
+            EmbedCheckPending: false,// Set when waiting for kick.com live-status check before showing embed
             IsMidroll: false,
             AdBreakStartedAt: 0,
             PodLength: 1,
@@ -294,6 +297,7 @@ twitch-videoad.js text/javascript
                     const pendingFetchRequests = new Map();
                     ${hasAdTags.toString()}
                     ${getMatchedAdSignifiers.toString()}
+                    ${extractKickSlug.toString()}
                     ${stripAdSegments.toString()}
                     ${getStreamUrlForResolution.toString()}
                     ${processM3U8.toString()}
@@ -320,6 +324,7 @@ twitch-videoad.js text/javascript
                     PreferLowQualityBackup = ${PreferLowQualityBackup};
                     FastAutoplayFirstTry = ${FastAutoplayFirstTry};
                     BackupSwapFirst = ${BackupSwapFirst};
+                    ChannelEmbeds = ${JSON.stringify(ChannelEmbeds)};
                     ForceAccessTokenPlayerType = '${ForceAccessTokenPlayerType}';
                     GQLDeviceID = ${GQLDeviceID ? "'" + GQLDeviceID + "'" : null};
                     AuthorizationHeader = ${AuthorizationHeader ? "'" + AuthorizationHeader + "'" : undefined};
@@ -373,6 +378,20 @@ twitch-videoad.js text/javascript
                         } else if (e.data.key == 'AllSegmentsAreAdSegments') {
                             AllSegmentsAreAdSegments = !AllSegmentsAreAdSegments;
                             console.log('AllSegmentsAreAdSegments: ' + AllSegmentsAreAdSegments);
+                        } else if (e.data.key == 'ChannelEmbedLive') {
+                            const si = StreamInfos[e.data.channel];
+                            if (si) {
+                                si.EmbedActive = true;
+                                si.EmbedCheckPending = false;
+                                console.log('[AD DEBUG] Channel embed live confirmed for ' + e.data.channel + ' — showing ' + e.data.url);
+                                postMessage({ key: 'ShowChannelEmbed', url: e.data.url, channel: e.data.channel });
+                            }
+                        } else if (e.data.key == 'ChannelEmbedOffline') {
+                            const si = StreamInfos[e.data.channel];
+                            if (si) {
+                                si.EmbedCheckPending = false;
+                                console.log('[AD DEBUG] Channel embed skipped for ' + e.data.channel + ' — offline on Kick (falling back to ad blocking)');
+                            }
                         }
                     });
                     hookWorkerFetch();
@@ -409,6 +428,37 @@ twitch-videoad.js text/javascript
                         doTwitchPlayerTask(true, false);
                     } else if (e.data.key == 'ReloadPlayer') {
                         doTwitchPlayerTask(false, true, e.data.kind);
+                    } else if (e.data.key == 'CheckChannelEmbed') {
+                        (async () => {
+                            const worker = this;
+                            try {
+                                const controller = new AbortController();
+                                const timeout = setTimeout(() => controller.abort(), 5000);
+                                const apiUrl = 'https://kick.com/api/v1/channels/' + encodeURIComponent(e.data.slug);
+                                const resp = await fetch(apiUrl, { signal: controller.signal });
+                                clearTimeout(timeout);
+                                if (resp.ok) {
+                                    const data = await resp.json();
+                                    console.log('[AD DEBUG] Kick API response for ' + e.data.slug + ':', data);
+                                    if (data.livestream && data.livestream.is_live) {
+                                        console.log('[AD DEBUG] ' + e.data.channel + ' is LIVE on kick.com — showing embed');
+                                        worker.postMessage({ key: 'ChannelEmbedLive', url: e.data.url, channel: e.data.channel });
+                                    } else {
+                                        console.log('[AD DEBUG] ' + e.data.channel + ' is OFFLINE on kick.com — falling back to ad blocking');
+                                        worker.postMessage({ key: 'ChannelEmbedOffline', channel: e.data.channel });
+                                    }
+                                } else {
+                                    throw new Error('HTTP ' + resp.status);
+                                }
+                            } catch (err) {
+                                console.log('[AD DEBUG] Kick live check failed for ' + e.data.channel + ' (' + err.message + ') — falling back to ad blocking');
+                                worker.postMessage({ key: 'ChannelEmbedOffline', channel: e.data.channel });
+                            }
+                        })();
+                    } else if (e.data.key == 'ShowChannelEmbed') {
+                        showChannelEmbed(e.data.url, e.data.channel);
+                    } else if (e.data.key == 'HideChannelEmbed') {
+                        hideChannelEmbed();
                     }
                 });
                 this.addEventListener('message', async event => {
@@ -631,6 +681,16 @@ twitch-videoad.js text/javascript
     }
     function getMatchedAdSignifiers(textStr) {
         return AdSignifiers.filter((s) => textStr.includes(s));
+    }
+    function extractKickSlug(url) {
+        try {
+            const u = new URL(url);
+            if (u.hostname.toLowerCase() === 'kick.com' || u.hostname.toLowerCase().endsWith('.kick.com')) {
+                const parts = u.pathname.split('/').filter(Boolean);
+                return parts[parts.length - 1] || null;
+            }
+        } catch (_) {}
+        return null;
     }
     // Remove ad segments from an m3u8 playlist and cache their URLs for replacement
     function stripAdSegments(textStr, stripAllSegments, streamInfo) {
@@ -927,6 +987,30 @@ twitch-videoad.js text/javascript
                 streamInfo.FreezeStartedAt = 0;
                 streamInfo.CsaiOnlyThisBreak = false;// Reset sticky CSAI flag for new break
                 console.log('[AD DEBUG] Ad detected — type: ' + (streamInfo.IsMidroll ? 'midroll' : 'preroll') + ', channel: ' + streamInfo.ChannelName + ', pod: ' + podLength + ' ad(s) (~' + (podLength * 30) + 's expected), signifiers: ' + getMatchedAdSignifiers(textStr).join(', '));
+                // Channel-specific embed: replace the Twitch player with an external embed
+                // (e.g. Kick) during the ad break. Shows the embed on first ad detect and hides
+                // it when the break ends. The Twitch player still receives stripped segments in
+                // the background so it stays synced with live content.
+                // For kick.com URLs, checks live status first — if the streamer is offline,
+                // falls back to normal ad-blocking instead of showing a dead embed.
+                if (ChannelEmbeds) {
+                    const channelLower = streamInfo.ChannelName ? String(streamInfo.ChannelName).toLowerCase() : '';
+                    const embedUrl = ChannelEmbeds[channelLower];
+                    if (embedUrl) {
+                        const kickSlug = extractKickSlug(embedUrl);
+                        if (kickSlug) {
+                            // kick.com URL — check live status before showing embed
+                            streamInfo.EmbedCheckPending = true;
+                            console.log('[AD DEBUG] Checking kick.com live status for ' + streamInfo.ChannelName + ' (slug: ' + kickSlug + ')');
+                            postMessage({ key: 'CheckChannelEmbed', url: embedUrl, channel: streamInfo.ChannelName, slug: kickSlug });
+                        } else {
+                            // Non-kick URL — immediate embed (existing behavior)
+                            streamInfo.EmbedActive = true;
+                            console.log('[AD DEBUG] Channel embed for ' + streamInfo.ChannelName + ' — showing ' + embedUrl);
+                            postMessage({ key: 'ShowChannelEmbed', url: embedUrl, channel: streamInfo.ChannelName });
+                        }
+                    }
+                }
                 postMessage({
                     key: 'UpdateAdBlockBanner',
                     isMidroll: streamInfo.IsMidroll,
@@ -1045,6 +1129,21 @@ twitch-videoad.js text/javascript
                 if (IsAdStrippingEnabled) {
                     textStr = stripAdSegments(textStr, false, streamInfo);
                 }
+                postMessage({
+                    key: 'UpdateAdBlockBanner',
+                    isMidroll: streamInfo.IsMidroll,
+                    hasAds: streamInfo.IsShowingAd,
+                    isStrippingAdSegments: streamInfo.IsStrippingAdSegments,
+                    numStrippedAdSegments: streamInfo.NumStrippedAdSegments,
+                    activeBackupPlayerType: null
+                });
+                return textStr;
+            }
+            // When a channel embed is active (e.g. Kick during xqc ads), skip the backup
+            // search entirely. The user is watching the embed instead, so the Twitch player
+            // just needs minimal segment stripping to stay synced with live.
+            if (streamInfo.EmbedActive) {
+                textStr = IsAdStrippingEnabled ? stripAdSegments(textStr, false, streamInfo) : textStr;
                 postMessage({
                     key: 'UpdateAdBlockBanner',
                     isMidroll: streamInfo.IsMidroll,
@@ -1384,6 +1483,16 @@ twitch-videoad.js text/javascript
                     // bleed across legitimately-handled backup-swap breaks (0 stripped + real
                     // ad attrs) and trigger the warning on partially-stale state.
                     streamInfo.ConsecutiveZeroStripBreaks = 0;
+                }
+                // Hide channel embed when ad break ends
+                if (streamInfo.EmbedActive) {
+                    streamInfo.EmbedActive = false;
+                    streamInfo.EmbedCheckPending = false;
+                    console.log('[AD DEBUG] Channel embed ended for ' + streamInfo.ChannelName + ' — hiding embed');
+                    postMessage({ key: 'HideChannelEmbed' });
+                } else if (streamInfo.EmbedCheckPending) {
+                    streamInfo.EmbedCheckPending = false;
+                    console.log('[AD DEBUG] Channel embed check pending for ' + streamInfo.ChannelName + ' — cleared on ad end');
                 }
                 streamInfo.IsShowingAd = false;
                 streamInfo.IsStrippingAdSegments = false;
@@ -1862,6 +1971,78 @@ twitch-videoad.js text/javascript
             }
         }
     }
+    let channelEmbedOverlay = null;// Reference to active channel embed overlay element
+    let channelEmbedPrevMuted = null;// Saved video.muted state before showing embed (null = no embed active)
+    // Show an external embed (e.g. Kick) over the Twitch player during an ad break.
+    // Creates a full-player-size overlay with an iframe. The embed is auto-removed
+    // when the ad break ends (HideChannelEmbed from worker).
+    function showChannelEmbed(url, channel) {
+        if (channelEmbedOverlay) return;// Already showing
+        const playerRootDiv = cachedPlayerRootDiv || document.querySelector('.video-player');
+        if (!playerRootDiv) {
+            console.log('[AD DEBUG] Cannot show channel embed — .video-player not found');
+            return;
+        }
+        const video = playerRootDiv.querySelector('video');
+        if (video) {
+            channelEmbedPrevMuted = video.muted;
+            video.muted = true;
+        }
+        channelEmbedOverlay = document.createElement('div');
+        channelEmbedOverlay.className = 'tas-channel-embed';
+        channelEmbedOverlay.style.cssText = 'position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 9999; background: #000; border: none; overflow: hidden;';
+        const iframe = document.createElement('iframe');
+        iframe.src = url;
+        iframe.style.cssText = 'width: 100%; height: 100%; border: none;';
+        iframe.allow = 'autoplay; fullscreen';
+        iframe.setAttribute('allowfullscreen', '');
+        channelEmbedOverlay.appendChild(iframe);
+        playerRootDiv.appendChild(channelEmbedOverlay);
+        console.log('[AD DEBUG] Channel embed shown — ' + channel + ' via ' + url);
+    }
+    function hideChannelEmbed() {
+        if (channelEmbedOverlay && channelEmbedOverlay.parentNode) {
+            channelEmbedOverlay.parentNode.removeChild(channelEmbedOverlay);
+            channelEmbedOverlay = null;
+            // Restore previous mute state — only unmute if it wasn't already muted
+            if (channelEmbedPrevMuted !== null) {
+                const playerRootDiv = cachedPlayerRootDiv || document.querySelector('.video-player');
+                if (playerRootDiv) {
+                    const video = playerRootDiv.querySelector('video');
+                    if (video) {
+                        video.muted = channelEmbedPrevMuted;
+                    }
+                }
+                channelEmbedPrevMuted = null;
+            }
+            console.log('[AD DEBUG] Channel embed hidden');
+        }
+    }
+    // Expose embed functions on window for console testing:
+    //   tasShowChannelEmbed('https://kick.com/xqc', 'xqc') — show test embed
+    //   tasHideChannelEmbed()                            — hide test embed
+    //   tasCheckKickLive('xqc')                         — check if kick.com channel is live
+    window.tasShowChannelEmbed = showChannelEmbed;
+    window.tasHideChannelEmbed = hideChannelEmbed;
+    window.tasCheckKickLive = async (slug) => {
+        try {
+            const resp = await fetch('https://kick.com/api/v1/channels/' + encodeURIComponent(slug));
+            console.log('[AD DEBUG] Kick API status: ' + resp.status);
+            if (resp.ok) {
+                const data = await resp.json();
+                console.log('[AD DEBUG] Kick API response:', data);
+                const isLive = !!(data.livestream && data.livestream.is_live);
+                console.log('[AD DEBUG] Kick live check for "' + slug + '": is_live = ' + isLive);
+                return isLive;
+            } else {
+                console.log('[AD DEBUG] Kick live check for "' + slug + '" failed: HTTP ' + resp.status);
+                return false;
+            }
+        } catch (err) {
+            console.log('[AD DEBUG] Kick live check for "' + slug + '" failed:', err.message);
+            return false;
+        }
+    };
     function updateAdblockBanner(data) {
         if (!cachedPlayerRootDiv || !cachedPlayerRootDiv.isConnected) {
             cachedPlayerRootDiv = document.querySelector('.video-player');
@@ -2397,6 +2578,22 @@ twitch-videoad.js text/javascript
             const style = document.createElement('style');
             style.textContent = '.tas-adblock-overlay { display: none !important; }';
             (document.head || document.documentElement).appendChild(style);
+        }
+        const lsChannelEmbeds = localStorage.getItem('twitchAdSolutions_channelEmbeds');
+        if (lsChannelEmbeds) {
+            try {
+                const parsed = JSON.parse(lsChannelEmbeds);
+                if (typeof parsed === 'object' && parsed !== null) {
+                    Object.keys(parsed).forEach(k => {
+                        if (typeof k === 'string' && typeof parsed[k] === 'string') {
+                            ChannelEmbeds[k.toLowerCase()] = parsed[k];
+                        }
+                    });
+                    console.log('[AD DEBUG] ChannelEmbeds overridden via localStorage: ' + JSON.stringify(ChannelEmbeds));
+                }
+            } catch (e) {
+                console.log('[AD DEBUG] Failed to parse twitchAdSolutions_channelEmbeds: ' + e.message);
+            }
         }
     } catch {}
     console.log('[AD DEBUG] Config: ReloadPlayerAfterAd = ' + ReloadPlayerAfterAd + ', ForceAccessTokenPlayerType = ' + ForceAccessTokenPlayerType + ', PinBackupPlayerType = ' + PinBackupPlayerType);
